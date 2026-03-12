@@ -1,0 +1,9 @@
+.gitattributes !filter !diff
+.gitignore !filter !diff
+
+*.md     filter=git-crypt diff=git-crypt
+*.canvas filter=git-crypt diff=git-crypt
+*.png    filter=git-crypt diff=git-crypt
+*.jpg    filter=git-crypt diff=git-crypt
+*.jpeg   filter=git-crypt diff=git-crypt
+*.pdf    filter=git-crypt diff=git-crypt
