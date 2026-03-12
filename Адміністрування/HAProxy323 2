@@ -1,0 +1,501 @@
+# HAProxy в 2025: от TCP до L7 — балансировка без боли
+ HAProxy (High Availability Proxy) — это высокопроизводительный, отказоустойчивый прокси-сервер и балансировщик нагрузки, способный работать как с HTTP(S), так и с TCP-трафиком.
+
+версию — 3.2.3
+
+## ACL
+**ACL** (Access Control List) — это универсальный инструмент, позволяющий описывать условия обработки запросов на основе различных признаков: IP-адреса клиента, пути и параметров URL, HTTP-заголовков, методов, доменов SNI, а также регулярных выражений и масок. По сути, ACL — это “условие if” в конфигурации HAProxy: оно вычисляется для каждого запроса, и в зависимости от результата (`true/false`) выбирается нужное действие — перенаправить, заблокировать, модифицировать или отправить в определённый backend. Благодаря ACL конфигурация перестаёт быть статичной и превращается в набор динамических правил, реагирующих на контекст запроса. Это особенно важно для маршрутизации (`routing`), когда от характеристик запроса зависит выбор целевого сервиса. Пару примеров смотри ниже:
+
+#### Маршрутизация по префиксу пути
+```
+acl is_api_path path_beg /api
+use_backend api_backend if is_api_path
+```
+Проверяет, начинается ли путь с `/api`; если да — трафик идёт в `api_backend`.
+
+#### Блокировка диапазона IP-адресов
+```
+acl blocked_ips src 192.168.0.0/24
+http-request deny if blocked_ips
+```
+Отклоняет запросы от клиентов из подсети 192.168.0.0/24.
+
+#### Фильтрация по HTTP-методу
+```
+acl is_post_method method POST
+use_backend write_backend if is_post_method
+```
+Если метод запроса `POST` — отправляем в `write_backend`.
+
+#### Сопоставление пути с RegExp
+```
+acl has_version_in_path path_reg ^/v[0-9]+/
+use_backend versioned_backend if has_version_in_path
+```
+Срабатывает, если путь начинается с `/v` и номера версии, например `/v2/users`.
+
+#### Маршрутизация по домену (SNI) в TLS
+```
+acl sni_is_api req_ssl_sni -i api.example.com
+use_backend api_backend if sni_is_api
+```
+Выбирает api_backend, если в `TLS SNI` указан домен `api.example.com`.
+
+#### Условие с несколькими признаками
+```
+acl is_mobile hdr_sub(User-Agent) Mobile
+acl is_logged_in cook(session_id) -m found
+use_backend mobile_backend if is_mobile is_logged_in
+```
+Отправляет запрос в mobile_backend, если `User-Agent` содержит “Mobile” и есть cookie `session_id`.
+
+ACL можно комбинировать, использовать логические операции AND/OR, отрицания (!), объединять их в сложные условия и выносить в отдельные секции для повторного применения. Именно на этой базе строятся гибкие сценарии маршрутизации, фильтрации и балансировки
+
+## Routing
+Балансировка на уровне L4 в HAProxy — это про простоту и скорость. Представьте, у нас есть база данных или любая другая TCP-служба, и мы хотим, чтобы запросы распределялись между несколькими серверами без лишней логики. L4 работает на транспортном уровне, не заглядывая внутрь пакетов, поэтому он быстрый, экономичный по ресурсам и легко переваривает десятки тысяч соединений. Настроить можно буквально в несколько строк: определяем порт, на котором слушаем трафик, и список серверов, куда его “пинаем”. Например, MySQL-клиент подключается к одному адресу, а HAProxy незаметно для него распределяет запросы между несколькими базами. Это удобно, когда важно просто держать нагрузку под контролем и не заморачиваться с анализом содержимого запросов.
+
+```
+frontend mysql
+  mode tcp
+  bind :3306
+  default_backend mysql_servers
+
+backend mysql_servers
+  mode tcp
+  balance leastconn
+  server s1 192.168.0.10:3306
+  server s2 192.168.0.11:3306
+```
+входящие TCP-подключения к порту 3306 равномерно распределяются между двумя MySQL-серверами. Такой режим практически не нагружает процессор, позволяет обрабатывать десятки тысяч соединений и подходит для сервисов, где не требуется анализ содержимого запросов. Однако он не даёт гибкости маршрутизации, так как решения принимаются только по IP и порту. Есть одно уточнение: **L4 можно использовать даже с HTTP(S)-приложением, если не требуется анализ содержимого пакетов (payload). В этом случае всё будет работать корректно — по сути, мы просто передаём сырые байты без разбора**
+
+Балансировка на уровне L7 — это уже “умная” маршрутизация. Здесь HAProxy понимает, что именно внутри запроса, и может принимать решения по пути, заголовкам, cookies, методу или даже версии API. Например, у нас есть веб-приложение: статику хотим отдавать с одних серверов, API-запросы — с других, а админку — только авторизованным пользователям. При этом мобильным клиентам можно выделить отдельный пул, чтобы не мешали десктопным. 
+
+Такой подход требует больше CPU и памяти из-за разбора протокола, но даёт максимальную гибкость в управлении трафиком и позволяет реализовывать сложные схемы маршрутизации.
+```
+frontend http_front
+    bind *:80
+    mode http
+
+    acl is_api path_beg /api
+    acl is_static path_end .css .js .png .jpg
+    acl is_admin hdr(host) -i admin.example.com
+    acl is_mobile hdr_sub(User-Agent) Mobile
+    acl has_auth cook(session_id) -m found
+
+    use_backend api_backend if is_api
+    use_backend static_backend if is_static
+    use_backend admin_backend if is_admin has_auth
+    use_backend mobile_backend if is_mobile !is_admin
+    default_backend default_web
+
+backend api_backend
+    balance leastconn
+    server api1 10.0.0.3:8080 check
+    server api2 10.0.0.4:8080 check
+
+backend static_backend
+    balance roundrobin
+    server cdn1 10.0.0.5:80 check
+    server cdn2 10.0.0.6:80 check
+
+backend admin_backend
+    balance source
+    server admin1 10.0.0.7:8080 check
+
+backend mobile_backend
+    balance roundrobin
+    server mob1 10.0.0.8:8080 check
+    server mob2 10.0.0.9:8080 check
+
+backend default_web
+    balance roundrobin
+    server web1 10.0.0.10:8080 check
+```
+
+Также доступны варианты настройки под `gRPC` или `HTTP/2` для взаимодействия между clients > haproxy (downstream) и haproxy > backends (upstream):
+```
+global
+    log stdout format raw local0
+    maxconn 4096
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+
+frontend fe_https
+    bind *:80
+    bind *:443 ssl crt /etc/haproxy/certs/mysite.pem alpn h2,http/1.1
+    http-request redirect scheme https unless { ssl_fc }
+    default_backend be_h2_tls
+
+frontend fe_h2c
+    bind *:8080 proto h2
+    default_backend be_h2c
+
+backend be_h2_tls
+    balance roundrobin
+    server srv1 10.0.0.11:9443 alpn h2 check ssl verify none
+    server srv2 10.0.0.12:9443 alpn h2 check ssl verify none
+
+backend be_h2c
+    balance roundrobin
+    server srv3 10.0.0.21:9000 proto h2 check
+    server srv4 10.0.0.22:9000 proto h2 check
+```
+В этой конфигурации HAProxy принимает входящие соединения от клиентов с поддержкой HTTP/2 (TLS) на фронтенде fe_https и без TLS (H2C) на фронтенде fe_h2c. В первом случае, при подключении по HTTPS с использованием ALPN (h2,http/1.1), клиент и HAProxy согласовывают протокол HTTP/2, который затем используется для обмена данными с backend-серверами по защищённому каналу TLS. Во втором случае H2C (HTTP/2 без TLS) применяется для внутреннего взаимодействия, где шифрование не требуется, но преимущества HTTP/2 (мультиплексирование, уменьшение задержек) сохраняются. Такой подход позволяет HAProxy как принимать, так и устанавливать соединения по HTTP/2 и H2C, оптимизируя трафик и обеспечивая совместимость с различными сценариями использования. **Если вы настраиваете HTTP/2 (или H2C — HTTP/2 без TLS) на upstream, убедитесь, что ваш backend-сервер поддерживает этот протокол**.
+
+## Stick Table
+Stick Table — это встроенный механизм хранения состояний в HAProxy, представляющий собой внутреннюю базу данных, где балансировщик ведёт учёт трафика в разрезе определённых ключей — чаще всего IP-адресов, cookie или session ID. С его помощью можно реализовать ограничение скорости запросов (rate limiting), контроль числа одновременных соединений (connection tracking), автоматическую защиту от DoS/DDoS-атак, а также привязку сессий (stickiness) к определённым backend-серверам. Stick Table работает как на TCP, так и на HTTP-уровне, что делает его универсальным инструментом для управления трафиком.
+
+Например, следующий конфиг создаёт таблицу с ключом по IP-адресу клиента, ограниченную одним миллионом записей, с временем жизни записи 10 секунд, в которой хранится статистика по скорости HTTP-запросов и установленных TCP-соединений за последние 10 секунд. В блоке frontend включено отслеживание IP-адреса клиента и добавлено правило: если он отправляет более 100 HTTP-запросов за 10 секунд, соединение немедленно отклоняется. Это простой, но эффективный способ защититься от сканеров, ботнетов и чрезмерно активных парсеров:
+```
+frontend ft_http
+    bind *:80
+    stick-table type ip size 1m expire 10s store http_req_rate(10s), conn_rate(10s)
+    http-request track-sc0 src
+    http-request deny if { sc_http_req_rate(0) gt 100 }
+```
+Stick-таблицы можно комбинировать с параметром maxconn, который задаёт ограничение на количество одновременных соединений: на глобальном уровне (`global maxconn`) — для всего процесса HAProxy, на уровне frontend — для входящих клиентских подключений, и на уровне server — для конкретного сервера в backend. При превышении лимита соединения ставятся в очередь, время ожидания которой определяется параметром `timeout queue`. Если за это время запрос не может быть обработан, клиент получает ошибку `503 Service Unavailable`. Следует учитывать, что значение maxconn напрямую зависит от лимита файловых дескрипторов в системе (`ulimit -n`), поскольку каждое соединение использует один дескриптор.
+```
+global
+    # Ограничение для всего процесса HAProxy
+    maxconn 20000
+
+    # Важно: нужно поднять лимит файловых дескрипторов в ОС
+    # ulimit -n 40000
+
+frontend http-in
+    bind *:80
+
+    # Лимит соединений на frontend
+    maxconn 5000
+
+    # Stick table для отслеживания скорости соединений с IP
+    stick-table type ip size 100k expire 30s store conn_rate(10s)
+
+    # Запоминаем IP клиента
+    tcp-request connection track-sc0 src
+
+    # Если клиент превысил 50 соединений за 10 секунд — блокируем на TCP уровне
+    tcp-request connection reject if { sc_conn_rate(0) gt 50 }
+
+    # Если хотим блокировать на HTTP-уровне (с кодом 403)
+    # http-request deny if { sc_conn_rate(0) gt 50 }
+
+    default_backend web-backend
+
+backend web-backend
+    # Пример backend с maxconn для каждого сервера
+    balance roundrobin
+
+    server web1 192.168.1.101:80 maxconn 2000 check
+    server web2 192.168.1.102:80 maxconn 2000 check
+```
+Помимо описанного механизма, `stick tables` позволяют строить сложные ACL и автоматические правила блокировки, например мгновенно разрывать соединение на TCP-уровне с помощью tcp-request connection reject, отклонять HTTP-запросы до их обработки через http-request reject или блокировать клиентов по скорости соединений (sc_conn_rate). Благодаря гибкости и универсальности stick tables можно рассматривать как встроенный мини-файрвол в HAProxy, способный в реальном времени реагировать на аномалии в трафике.
+
+Подробнее о механизме перегрузки можно прочитать [здесь](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/performance/overload-protection/). существует множество вариантов хранения и ведения key-value таблиц с подробным разбором [по этой ссылке](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/proxying-essentials/custom-rules/stick-tables/)
+
+## Timeouts
+В конфигурации HAProxy директивы `timeout` используются для определения различных предельных временных интервалов, влияющих на установление соединений, передачу запросов и откликов, а также поведение `keep-alive`-соединений. Все таймауты задаются в секундах, миллисекундах или комбинированном формате (10s, 500ms, 1m), и их можно указывать как в секции `defaults`, так и в секциях `frontend` или `backend` — приоритет отдается более локальной настройке. Таймауты — очень важные настройки. Они помогают избежать долгих висящих TCP-соединений, которые могут занимать дескрипторы, и позволяют использовать эти ресурсы для других соединений.
+
+- **`timeout connect`** — максимальное время, в течение которого HAProxy будет ждать установления TCP-соединения с backend-сервером. Если сервер не отвечает или не принимает соединение в течение заданного времени, запрос считается неуспешным. Этот таймаут особенно важен при наличии "медленных" или перегруженных серверов. В современных сетях данный таймаут можно устанавливать очень маленьким в пределах 500msдля одного ЦОДа.
+- **`timeout client`** — таймаут бездействия от клиента. Если клиент не отправляет никаких данных в течение указанного времени, соединение закрывается. Это защищает от "зависших" клиентов и атак типа slowloris.
+- **`timeout server`** — аналогично timeout client, но применяется к соединению между HAProxy и backend-сервером. Если backend не отвечает или завис, соединение завершится по истечении заданного времени
+- **`timeout http-request`** — максимальное время ожидания полного HTTP-запроса от клиента. Если клиент не отправил заголовки целиком за этот период, соединение закрывается. Это важная защита от атак с медленной отправкой заголовков.
+- **`timeout http-keep-alive`** — максимальное время, в течение которого HAProxy будет держать открытое keep-alive-соединение от клиента, ожидая новый HTTP-запрос. Если за это время запрос не поступает — соединение закрывается. Используется в HTTP/1.1 persistent connections.
+- **`timeout queue`** — максимальное время, которое запрос может провести в очереди backend-пула, ожидая свободного сервера. Если все сервера заняты, и клиент ждет ответа дольше указанного времени — запрос прерывается. Это полезно для защиты от перегрузки и вывода соответствующего статуса клиенту (например, 503).
+- **`timeout tarpit`** — время ожидания при использовании механизма tarpitting (например, при блокировке клиентов). Это может применяться для создания искусственной задержки на подозрительных запросах.
+- **`timeout tunnel`** — таймаут неактивности в туннелируемых соединениях, например при TCP proxy или WebSocket. Используется для управления временем простоя в туннеле без активности.
+- **`timeout client-fin`** и **`timeout server-fin`** — таймаут ожидания завершения TCP-соединения после получения FIN от клиента или сервера соответственно. Обычно не требуется настраивать явно, но в случае TCP-режима могут пригодиться.
+- **`timeout check`** — таймаут для health-check соединений с backend-серверами. Определяет, сколько времени HAProxy будет ждать отклика на активный health-check. Если время истекло — сервер считается недоступным.
+```
+defaults
+  timeout connect 500ms
+  timeout client 30s
+  timeout server 30s
+  timeout http-request 3s
+  timeout http-keep-alive 10s
+  timeout queue 10s
+  timeout tarpit 10s
+  timeout tunnel 30m
+  timeout client-fin 10s
+  timeout server-fin 10s
+  timeout check 3s
+```
+Данные таймауты можно взять, как минимальная отправная точка, а дальше уже крутить по своему усмотрению. Важно понимать, что слишком короткие таймауты приведут к обрывам соединений и ошибкам у клиентов, а слишком длинные — увеличат нагрузку на HAProxy из-за большого количества "висящих" соединений. В продакшн-среде таймауты необходимо тщательно подбирать, ориентируясь на реальное поведение клиентов, latency backend-сервисов и допустимый уровень отказов.
+
+Также стоит учитывать, что в режиме TCP (`mode tcp`) будут учитываться только `timeout connect`, `timeout client`, `imeout server`, `timeout tunnel` и `timeout check`, в то время как HTTP-специфичные параметры (например, `timeout http-request`) применяются только в `mode http`.
+
+## Health check
+
+Health-check’и исключают нерабочие сервера из пула до того, как на них начнёт идти трафик. В HAProxy 3.2.3 улучшены проверки по TCP, HTTP, TLS и кастомным сценариям. Таймауты в чекерах обязательны: если узел долго отвечает — он считается "плохим", и на него не шлются новые запросы. Это предотвращает задержки и снижает количество ошибок на стороне клиента.
+
+```
+backend tcp_check_send_expect
+    mode tcp
+    option tcp-check
+    tcp-check connect
+    tcp-check send "PING\r\n"
+    tcp-check expect string "PONG"
+    server srv1 10.0.0.21:6379 check inter 3s fall 3 rise 2
+
+backend tcp_check_code
+    mode tcp
+    option tcp-check
+    tcp-check connect
+    tcp-check send "HELLO\r\n"
+    tcp-check expect binary 0x4F4B
+    server srv2 10.0.0.22:9000 check inter 2s fall 2 rise 1
+
+backend tcp_check_regex
+    mode tcp
+    option tcp-check
+    tcp-check connect
+    tcp-check send "STATUS\r\n"
+    tcp-check expect rstring "READY.*OK"
+    server srv3 10.0.0.23:7000 check inter 4s fall 3 rise 2
+
+backend tcp_check_with_timeout
+    mode tcp
+    option tcp-check
+    timeout check 1s
+    tcp-check connect
+    tcp-check send "HEALTH\r\n"
+    tcp-check expect string "ALIVE"
+    server srv4 10.0.0.24:1883 check inter 3s fall 2 rise 1
+
+backend tcp_check_negate
+    mode tcp
+    option tcp-check
+    tcp-check connect
+    tcp-check send "CHECK\r\n"
+    tcp-check expect ! string "FAIL"
+    server srv5 10.0.0.25:5000 check inter 2s fall 2 rise 1
+
+backend tcp_check_no_send
+    mode tcp
+    option tcp-check
+    tcp-check connect
+    tcp-check expect rstring "^OK$"
+    server srv6 10.0.0.26:6000 check inter 5s fall 3 rise 1
+```
+Что здесь происходит: в `tcp-check` HAProxy сам устанавливает TCP-соединение и может посылать произвольные байты (`send`), ожидая определённый ответ (`expect`). В `expect string "PONG"` ищется ASCII-строка PONG в ответе. В `expect binary 0x4F4B` проверяются первые два байта ответа на совпадение с кодом `OK`. В `expect rstring "READY.*OK"` используется регулярное выражение для анализа тела ответа. В `timeout check 1s` ограничено время проверки. В `! string "FAIL"` сервер считается здоровым, если строка `FAIL` не найдена. В примере без `send` HAProxy просто ждёт приветственный баннер от сервера и проверяет его. Все проверки активные: HAProxy открывает TCP-соединение, опрашивает сервис и помечает его UP/DOWN по заданным условиям (`fall` — сколько подряд ошибок для признания DOWN, `rise` — сколько успешных ответов для восстановления, `inter` — интервал проверок).
+```
+backend app_http_check_string
+    mode http
+    option httpchk GET /health HTTP/1.1\r\nHost:\ example.com
+    http-check expect string "OK"
+    server srv1 10.0.0.11:80 check inter 3s fall 3 rise 2
+
+backend app_http_check_code
+    mode http
+    option httpchk GET /status
+    http-check expect status 200
+    server srv2 10.0.0.12:80 check inter 2s fall 2 rise 1
+
+backend app_http_check_multi_code
+    mode http
+    option httpchk GET /alive
+    http-check expect rstatus ^2(00|04)$
+    server srv3 10.0.0.13:8080 check inter 4s fall 3 rise 2
+
+backend app_http_check_body_regex
+    mode http
+    option httpchk GET /healthz HTTP/1.1\r\nHost:\ internal
+    http-check expect rstring "HEALTHY.*READY"
+    server srv4 10.0.0.14:80 check inter 5s fall 3 rise 1
+
+backend app_http_check_timeout
+    mode http
+    option httpchk GET /health
+    timeout check 1s
+    http-check expect status 200
+    server srv5 10.0.0.15:8080 check inter 3s fall 2 rise 1
+
+backend app_http_check_optional
+    mode http
+    option httpchk GET /ping
+    http-check disable-on-404
+    http-check expect status 200
+    server srv6 10.0.0.16:80 check inter 4s fall 2 rise 1
+
+backend app_http_check_negate
+    mode http
+    option httpchk GET /check
+    http-check expect ! string "FAIL"
+    server srv7 10.0.0.17:80 check inter 2s fall 2 rise 1
+```
+В этом примере: `http-check expect string "OK"` проверяется наличие строки "OK" в теле ответа, сервер считается здоровым только если она найдена. В `expect status 200` проверяется ровно код ответа 200. В `rstatus ^2(00|04)$` принимаются коды 200 или 204 через регулярное выражение. В `rstring "HEALTHY.*READY"` проверяется тело ответа по regex. В `timeout check 1s` задаётся ограничение на время health-чека. В `disable-on-404` сервер не считается «плохим», если отвечает `404`. В `! string "FAIL"` используется отрицательная проверка — сервер признаётся здоровым, если строка `FAIL` не найдена. Все проверки выполняются активными health-чеками: HAProxy сам шлёт HTTP-запросы к каждому серверу и помечает его UP/DOWN в зависимости от совпадения условий
+
+Но, это мы рассмотрели **активные health checks** — они работают по принципу периодической проверки состояния backend. Есть также и **пассивные механизмы**, которые реагируют на реальные ошибки во время обработки трафика. В версии **3.2.3** появилась улучшенная поддержка `circuit breaker` — инструментов, позволяющих автоматически изолировать отказавшие или перегруженные узлы, предотвращая лавинообразную деградацию всей системы.
+
+В документации также приведен более сложный пример реализации «размыкателя цепи» (Circuit Breaker), где используются таблицы, счетчики и условия для временного исключения бекенда из пула. Сейчас рассмотрим более простые для понимания примеры:
+```
+backend tcp_backend
+    mode tcp
+    option tcp-check
+    server db1 10.0.0.10:5432 check on-error mark-down observe layer4
+    server db2 10.0.0.11:5432 check on-error mark-down observe layer4
+```
+Здесь backend работает в TCP-режиме (например, проксирование PostgreSQL или Redis). Активный TCP health check (`tcp-check`) проверяет порт, но дополнительный механизм `on-error mark-down observe layer4` позволяет HAProxy пометить сервер как недоступный **при ошибках установления соединения в реальном трафике** — например, при таймаутах или TCP reset. Это снижает время реакции по сравнению с периодическими проверками и реализует пассивный circuit breaker на уровне транспорта.
+```	
+backend api_backend
+    mode http
+    option httpchk GET /health
+    stick-table type ip size 100k expire 30s store gpc0,conn_rate(10s),http_req_rate(10s),http_err_rate(10s)
+    http-request track-sc0 src
+    http-request deny if { sc_http_err_rate(api_backend) gt 10 }
+    server api1 10.0.0.1:8080 check on-error mark-down observe layer7
+    server api2 10.0.0.2:8080 check on-error mark-down observe layer7
+```
+Здесь backend обслуживает HTTP-запросы. В `stick-table` собирается статистика по IP-адресам: частота соединений, запросов и количество HTTP-ошибок. Если с одного IP за 10 секунд приходит более 10 ошибок (например, 5xx), срабатывает `http-request deny` — это circuit breaker на прикладном уровне, отключающий проблемного клиента. Также используется `observe layer7`, чтобы исключать backends при высоком уровне HTTP-ошибок в ответах. Это даёт более **гибкий и точный контроль отказов** в сложных API-сценариях.
+
+И напоследок еще пару интересных встроенных health-check'ов для MySQL, PostgreSQL, Redis, SMTP и LDAP:
+```
+backend mysql_check
+    mode tcp
+    option mysql-check user root post-41
+    server db1 10.0.0.31:3306 check inter 3s fall 3 rise 2
+
+backend pgsql_check
+    mode tcp
+    option pgsql-check user haproxy
+    server db2 10.0.0.32:5432 check inter 3s fall 3 rise 2
+
+backend redis_check
+    mode tcp
+    option redis-check
+    server cache1 10.0.0.33:6379 check inter 2s fall 2 rise 1
+
+backend smtp_check
+    mode tcp
+    option smtpchk EHLO haproxy.local
+    server mail1 10.0.0.34:25 check inter 5s fall 3 rise 1
+
+backend ldap_check
+    mode tcp
+    option ldap-check
+    server ldap1 10.0.0.35:389 check inter 4s fall 3 rise 2
+```
+
+В новых релизах имеются встроенные готовые проверки для популярных протоколов, которые не требуют ручного `tcp-check send/expect`. Для MySQL можно использовать `option mysql-check user root` — HAProxy сам выполняет handshake и проверяет, что сервер отвечает корректно (если добавить пароль — `option mysql-check user root post-41` с параметрами). Для PostgreSQL добавили `option pgsql-check user haproxy` — выполняется начальное подключение с проверкой статуса базы. Для Redis есть `option redis-check` — HAProxy сам отправляет PING и ждёт PONG. Для SMTP применяется `option smtpchk` (при необходимости с EHLO: `option smtpchk EHLO haproxy.local`), сервер проверяется по баннеру и ответу на команду. Для LDAP доступна `option ldap-check` — HAProxy инициирует bind-запрос и валидирует ответ каталога. Эти встроенные функции значительно упрощают конфигурацию: не нужно вручную описывать tcp-check send/expect, так как логика проверки зашита внутри HAProxy и корректно обрабатывает нюансы протоколов, включая таймауты, коды и форматы ответов.
+
+## Retries
+Также в версии 3.2.3 директивы `retries`, `option redispatch` и `retry-on` обеспечивают гибкое управление повторными попытками при сбоях, повышая отказоустойчивость. В разделе `defaults` задаются глобальные параметры: `retries` устанавливает число попыток при неудаче соединения, а `option redispatch` разрешает перенаправление запроса на другой backend, если первоначально выбранный сервер недоступен. Для TCP-бэкенда (L4) повторы возможны лишь до начала передачи данных — например, при `conn-failure` или `empty-response` — и применимы только для ошибок на этапе установления соединения. В HTTP-бэкенде (L7) механизм более тонкий: `retry-on` позволяет указать условия повторов при HTTP-ошибках, включая 5xx-ответы, сбои шлюза (502, 503, 504) и др., а также учитывать, какие HTTP-методы допустимы к повтору. Чтобы избежать дублирования при исполнении запросов, меняющих состояние (POST, PUT, DELETE), используется `http-request disable-l7-retry if METH_POST METH_PUT METH_DELETE`.
+```
+defaults
+    retries 4
+    option redispatch
+
+backend dynamic_backend
+    mode http
+    retries 3
+    retry-on 500 502 503 504 conn-failure 0rtt-rejected
+    http-request disable-l7-retry if METH_POST METH_PUT METH_DELETE
+    server app1 10.1.0.1:8080 check
+    server app2 10.1.0.2:8080 check
+
+backend analytics_tcp
+    mode tcp
+    tcp-request content set-retries 10 if { nbsrv(analytics_tcp) 1 }
+    retry-on conn-failure empty-response
+    server db1 10.2.0.1:5432 check
+    server db2 10.2.0.2:5432 check
+
+backend mixed_l7_l4
+    mode http
+    retry-on 408 425 conn-failure
+    http-request set-retries 10 if { nbsrv(mixed_l7_l4) 1 }
+    http-request disable-l7-retry if METH_POST
+    server mix1 10.3.0.1:8000 check
+    server mix2 10.3.0.2:8000 check
+```
+
+В секции `defaults` задаются общие параметры, которые наследуются всеми frontends и backends, если они не переопределены локально. Здесь `retries 4` означает, что при недоступности сервера HAProxy будет пробовать перенаправить запрос до четырёх раз. Директива `option redispatch` разрешает повторно отправлять запрос на другой сервер в пуле, если выбранный ранее сервер стал недоступен.
+
+Backend **`dynamic_backend`** работает в режиме HTTP (mode http). Здесь `retries 3` локально переопределяет общее значение из defaults. Параметр `retry-on` определяет список ошибок (500, 502, 503, 504, сбой соединения и отказ 0-RTT), при которых возможна повторная отправка запроса. Однако, для методов POST, PUT и DELETE (`http-request disable-l7-retry if METH_POST METH_PUT METH_DELETE`) повторные попытки уровня L7 запрещены, чтобы избежать дублирования операций, изменяющих данные.
+
+Backend **`analytics_tcp`** работает в TCP-режиме (mode tcp). Здесь `retries 2` означает две попытки повторного соединения. Инструкция `tcp-request content set-retries 10 if { nbsrv(analytics_tcp) 1` } увеличивает число попыток до 10, если в группе `analytics_tcp` остался только один активный сервер. Параметр retry-on conn-failure empty-response` задаёт условия повторного соединения при обрыве или пустом ответе.
+
+Backend **`mixed_l7_l4`** — пример смешанной логики, когда используется HTTP-режим, но ошибки обрабатываются частично как на L7, так и на L4. Здесь `retry-on 408 425 conn-failure` определяет список HTTP-кодов и ошибок соединения для повторной попытки. Инструкция `http-request set-retries 10 if { nbsrv(webservers) 1 }` аналогична TCP-варианту, но применяется к HTTP. Директива `http-request disable-l7-retry if METH_POST` запрещает L7-повторы для POST-запросов.
+
+Также полный статус кодов для разных уровней:
+
+- TCP: conn-failure, empty-response, junk-response, response-timeout, 0rtt-rejected или все вместе all-retryable-errors
+- HTTP: 404, 408, 425, 500, 501, 502, 503, 504
+
+С полным списком и более подробно можно ознакомится [here](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/reliability/retries/)
+## Traffic Shaping
+**Traffic shaping** — это механизм управления пропускной способностью, позволяющий замедлять передачу HTTP-запросов и ответов при превышении заданных лимитов, а не отбрасывать трафик, как это происходит при `traffic policing`. Он действует на уровне HTTP, эффективно разглаживая нагрузку и предотвращая сетевой перегруз, при этом сохраняя качество обслуживания сервисов, где важно не допустить лавинообразного роста соединений.
+
+В HAProxy traffic shaping реализован посредством фильтров `bandwidth limitation filter`. Применимы разные фильтры для загрузки (upload, входящий трафик) и выгрузки (download, исходящий трафик):
+#### Upload (входящий трафик):
+```
+frontend http-in
+    filter bwlim-in default-limit 62500 default-period 1s
+    http-request set-bandwidth-limit
+```
+#### Download (исходящий трафик):
+```
+backend http-out
+    filter bwlim-out default-limit 62500 default-period 1s
+    http-response set-bandwidth-limit
+```
+Здесь `default-limit` задаёт объём данных (в байтах) за период `default-period` — в примере 62 500 B/s, что примерно равно 5 Mbps
+## Variables
+Переменные делятся по области видимости, и правильный выбор влияет на производительность и корректность логики. Переменные `proc` создаются на весь процесс HAProxy и одинаковы для всех соединений — их редко применяют, так как они подходят только для глобальных счётчиков или флагов, общих для всех клиентов. Переменные `sess` привязаны к сессии клиента и сохраняются, пока существует TCP-соединение; их стоит использовать, если нужно сохранить одно и то же значение между несколькими запросами без пересоздания, например IP клиента, время входа или маркер сессии. Переменные `txn` живут только во время обработки **конкретного запроса и ответа** — они изолированы от других запросов и подходят для хранения данных авторизации, одноразовых ACL или вычислений, которые не должны попадать в другие запросы пользователя. Переменные req и res ещё более локальны: они существуют только при обработке запроса или ответа соответственно и удобны, если данные нужны исключительно внутри одного фильтра или действия, например для модификации заголовков на лету или анализа кода ответа бэкенда без влияния на другие транзакции. Выбор области видимости сводится к принципу минимального времени жизни: **глобальные** переменные нужны крайне редко, **сессионные** — для повторного использования между запросами, **транзакционные** — для данных одного запроса и ответа, а request/response — для разовой inline-обработки без побочных эффектов.
+
+Например, можно сохранить IP клиента и использовать его во множестве мест:
+```
+frontend fe_main
+    bind :80
+    http-request set-var(sess.client_ip) src
+    http-request set-log-level info if { var(sess.client_ip) -m ip 192.168.0.0/24 }
+    default_backend be_main
+```
+Здесь переменная `sess.client_ip` фиксируется при первом запросе и доступна для всех последующих запросов того же соединения, что удобно для логирования или применения ACL без повторного вызова `src`. Другой пример показывает работу с переменными транзакции для авторизации и маршрутизации:
+```
+frontend fe_auth
+    bind :443 ssl crt /etc/haproxy/certs.pem
+    http-request set-var(txn.token) req.hdr(Authorization)
+    acl valid_token var(txn.token) -m reg ^Bearer\ .+
+    use_backend be_api if valid_token
+    default_backend be_denied
+```
+В этом случае переменная `txn.token` существует только во время обработки текущего запроса и ответа — она извлекается из заголовка и сразу проверяется ACL, не попадая в другие запросы или сессии. Также переменные удобно применять для передачи служебных данных в backend:
+```
+backend be_api
+    http-request set-header X-Request-Start %[date()]
+    http-request set-header X-Auth-Token %[var(txn.token)]
+    http-response set-var(res.status) status
+    http-response set-log-level err if { var(res.status) -m int ge 500 }
+    server s1 10.0.0.1:8080
+```
+Здесь в заголовки запроса добавляется текущая временная метка и значение `token`, а в ответе сохраняется код состояния бэкенда в переменную `res.status`, что позволяет гибко логировать или реагировать на ошибки без глобальных флагов. Переменные позволяют реализовать динамическую маршрутизацию (например, через `set-var` и `use-server`), сложные схемы трейсинга (фиксируя timestamp на входе и вычисляя задержку на выходе) и управлять логикой отказоустойчивости (сохраняя счётчики ошибок прямо в сессии или анализируя коды ответа в res-переменных).
+
+## HTTP/3 (QUIC)
+если вы захотите опробовать HTTP/3 на своих проектах, придётся собирать бинарный файл вручную
+В версии 3.2.3 также представлена экспериментальная поддержка HTTP/3. Это позволяет обрабатывать клиентские запросы и значительно снижать задержки за счёт усовершенствованной мультиплексии и устранения необходимости в отдельных рукопожатиях (handshake) для TCP и TLS, поскольку QUIC объединяет в себе транспортный и криптографический (TLS) уровни.
+```
+frontend fe
+  mode http
+  bind :80
+  bind :443  ssl crt /etc/haproxy/certs/foo.com/cert.crt alpn h2
+  bind quic4@:443 ssl crt /mycert.pem alpn h3
+
+  http-request redirect scheme https unless { ssl_fc }
+
+  http-after-response add-header alt-svc 'h3=":443"; ma=60'
+```
+В такой конфигурации доступны три слушателя. При первом подключении веб-браузер использует HTTP/1.1 на удалённом порту 80. HAProxy перенаправит браузер на порт 443 и переключится на протокол HTTP/2. Конечная точка **QUIC** будет обнаружена через объявление Alt-Svc заголовок. Затем новое QUIC-подключение на порту 443 проведёт обмен данными. В этом примере Alt-Svc помечен как действительный в течение 60 секунд. Как только это время истечёт, браузер вернётся к подключению по HTTP/2. Установка такого небольшого значения удобна при первоначальном тестировании и может быть увеличена, когда QUIC начнёт работать должным образом.
+
+добавлю что можно проводить проверки по ssl, как на рабочий tls1.2 так и на расширение 1.3, так же есть проверки ssl для QUIC. Нужен будет Clienthello для передачи при проверке
+
+обзора переменных, там весьма нетривильное время жизни и область видимости у них, либо нужно создавать переменную как можно раньше, либо возникаю трудности с передачей переменных в нужный бэкенд.
+
+Пример:
+```
+  http-request set-var(txn.mypath) path
+  http-response add-header X-Path %[var(txn.mypath)]
+```
